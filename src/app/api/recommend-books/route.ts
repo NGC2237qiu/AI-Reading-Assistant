@@ -87,10 +87,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 检查是否有 API Key
-    const apiKey = process.env.COZE_API_KEY;
-    console.log('API Key exists:', !!apiKey);
-    console.log('API Key prefix:', apiKey ? apiKey.substring(0, 10) + '...' : 'none');
+    // 检查环境变量
+    const apiKey = process.env.COZE_API_KEY || process.env.OPENAI_API_KEY;
+    console.log('COZE_API_KEY exists:', !!process.env.COZE_API_KEY);
+    console.log('OPENAI_API_KEY exists:', !!process.env.OPENAI_API_KEY);
+    console.log('Using API Key from:', process.env.COZE_API_KEY ? 'COZE_API_KEY' : process.env.OPENAI_API_KEY ? 'OPENAI_API_KEY' : 'none');
 
     if (!apiKey) {
       console.log('No API Key found, using mock data');
@@ -109,10 +110,8 @@ export async function POST(request: NextRequest) {
     try {
       const customHeaders = HeaderUtils.extractForwardHeaders(request.headers);
 
-      // 创建配置，传入 API Key
-      const config = new Config({
-        apiKey: apiKey,
-      });
+      // 创建配置，SDK 会自动从环境变量加载 API Key
+      const config = new Config();
 
       const llmClient = new LLMClient(config, customHeaders);
       console.log('LLM Client created successfully');
