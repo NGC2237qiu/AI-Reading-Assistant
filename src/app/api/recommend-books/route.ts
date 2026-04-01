@@ -1,6 +1,45 @@
 import { NextRequest } from 'next/server';
 import { LLMClient, Config, HeaderUtils } from 'coze-coding-dev-sdk';
 import { bookstoreService, Book } from '@/lib/bookstore';
+import { getMockRecommendation } from '@/lib/mock-ai';
+
+/**
+ * 生成降级推荐（当 AI 不可用时）
+ */
+function generateFallbackRecommendation(preference: string, books: Book[]): string {
+  const response: string[] = [];
+
+  response.push('## 推荐理由');
+  response.push(`根据您的阅读偏好"${preference}"，我们为您推荐以下书籍。由于 AI 服务暂时不可用，这里展示的是基于书库匹配的推荐结果。`);
+  response.push('');
+
+  response.push('## 书籍推荐');
+  response.push('');
+
+  if (books.length > 0) {
+    books.slice(0, 5).forEach((book, index) => {
+      response.push(`### ${index + 1}. ${book.title}`);
+      response.push(`**⭐ 评分**: ${book.averageRating ? `${book.averageRating}/5` : '暂无评分'} (${book.ratingsCount || 0}人评价)`);
+      response.push(`**👤 作者**: ${book.authors.join('、') || '未知'}`);
+      response.push(`**🏢 出版社**: ${book.publisher || '未知'}`);
+      response.push(`**📅 出版日期**: ${book.publishedDate || '未知'}`);
+      response.push(`**📝 简介**: ${book.description?.slice(0, 200) || '暂无简介'}${book.description && book.description.length > 200 ? '...' : ''}`);
+      response.push(`**💡 推荐理由**: 这本书符合您的阅读偏好，推荐您阅读。`);
+      response.push('');
+      response.push('---');
+      response.push('');
+    });
+  } else {
+    response.push(`抱歉，暂时没有找到符合"${preference}"的书籍。`);
+    response.push('');
+    response.push('💡 建议：');
+    response.push('1. 尝试使用更具体的关键词');
+    response.push('2. 稍后再试，AI 服务可能正在恢复');
+    response.push('3. 浏览书库中的其他热门书籍');
+  }
+
+  return response.join('\n');
+}
 
 /**
  * 将书籍信息转换为AI可读的上下文格式
@@ -31,10 +70,14 @@ ${contextLines.join('\n---\n')}
 }
 
 export async function POST(request: NextRequest) {
+  console.log('=== Recommend Books API Called ===');
+
   try {
     const { preference } = await request.json();
+    console.log('User preference:', preference);
 
     if (!preference || typeof preference !== 'string' || preference.trim().length === 0) {
+      console.log('Error: Empty preference');
       return new Response(
         JSON.stringify({ error: '请输入您的阅读偏好' }),
         {
@@ -44,126 +87,37 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const customHeaders = HeaderUtils.extractForwardHeaders(request.headers);
-    const config = new Config();
-    const llmClient = new LLMClient(config, customHeaders);
+    // 检查是否有 API Key
+    const apiKey = process.env.COZE_API_KEY;
+    console.log('API Key exists:', !!apiKey);
+    console.log('API Key prefix:', apiKey ? apiKey.substring(0, 10) + '...' : 'none');
 
-    // 第一步：从书库搜索相关书籍
-    const searchSystemPrompt = `你是一位专业的阅读助手。你的任务是根据用户的阅读偏好，生成3-5个关键词用于从书库中搜索相关书籍。
-
-请遵循以下规则：
-1. 分析用户的阅读偏好，提取关键信息（类型、风格、主题等）
-2. 生成3-5个搜索关键词
-3. 关键词要简洁明了，适合用于书库搜索
-4. 优先考虑中文书籍相关的关键词
-5. 输出格式必须是JSON数组，只包含关键词字符串
-
-输出格式示例：
-["古言 甜宠", "轻松 古代言情", "甜文 爱情"]
-
-请只输出JSON数组，不要包含任何其他文字或说明。`;
-
-    const searchMessages = [
-      { role: 'system' as const, content: searchSystemPrompt },
-      { role: 'user' as const, content: `用户偏好：${preference}` }
-    ];
-
-    // 获取搜索关键词
-    const searchResponse = await llmClient.invoke(searchMessages, {
-      model: 'doubao-seed-1-8-251228',
-      temperature: 0.7,
-      thinking: 'disabled',
-      caching: 'disabled'
-    });
-
-    // 解析AI生成的关键词
-    let keywords: string[] = [];
-    try {
-      const cleanedContent = searchResponse.content.trim();
-      const jsonMatch = cleanedContent.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        keywords = JSON.parse(jsonMatch[0]);
-      }
-    } catch (error) {
-      console.error('Failed to parse keywords:', error);
-    }
-
-    // 如果没有生成关键词，使用用户原始偏好
-    if (keywords.length === 0) {
-      keywords = [preference];
-    }
-
-    // 从书库搜索书籍
-    const books: Book[] = [];
-    const usedBookIds = new Set<string>();
-
-    for (const keyword of keywords) {
-      try {
-        const searchResult = await bookstoreService.searchBooks({
-          query: keyword,
-          maxResults: 5,
-          langRestrict: 'zh',
-          orderBy: 'relevance'
-        });
-
-        for (const book of searchResult.items) {
-          if (!usedBookIds.has(book.id) && books.length < 10) {
-            usedBookIds.add(book.id);
-            books.push(book);
-          }
+    if (!apiKey) {
+      console.log('No API Key found, using mock data');
+      const mockResponse = getMockRecommendation(preference);
+      return new Response(mockResponse, {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-cache',
         }
-
-        if (books.length >= 10) break;
-      } catch (error) {
-        console.error(`Failed to search for keyword "${keyword}":`, error);
-        continue;
-      }
+      });
     }
 
-    // 第二步：判断是否有书籍，决定使用哪种推荐方式
-    let recommendMessages: any[];
-    let useBookstore = books.length > 0;
+    console.log('Using AI API with Key...');
 
-    if (useBookstore) {
-      // 有书库数据：基于真实书籍信息推荐
-      const booksContext = formatBooksAsContext(books);
+    // 尝试使用 AI 生成推荐
+    try {
+      const customHeaders = HeaderUtils.extractForwardHeaders(request.headers);
 
-      const recommendSystemPrompt = `你是一位专业的网文推荐助手。你的任务是根据用户的阅读偏好，结合书库中真实的书籍信息，为用户提供个性化的推荐。
+      // 创建配置，传入 API Key
+      const config = new Config({
+        apiKey: apiKey,
+      });
 
-请遵循以下规则：
-1. 基于提供的真实书籍信息进行推荐，不要编造不存在的书籍
-2. 推荐理由要具体，说明为什么这本书符合用户的偏好
-3. 突出每本书的特色和亮点
-4. 推荐3-5本最符合用户偏好的书籍
-5. 输出格式清晰易读，便于用户快速浏览
-6. 包含书籍的真实信息（书名、作者、评分、简介等）
+      const llmClient = new LLMClient(config, customHeaders);
+      console.log('LLM Client created successfully');
 
-输出模板：
-## 推荐理由
-[简要说明为什么推荐这些书籍]
-
-## 书籍推荐
-
-### 1. [书名]
-**⭐ 评分**: [评分]/5 ([评价人数]人评价)
-**👤 作者**: [作者名]
-**🏢 出版社**: [出版社]
-**📅 出版日期**: [出版日期]
-**📝 简介**: [简短介绍]
-**💡 推荐理由**: [为什么推荐这本书，如何符合用户偏好]
-
----
-
-[继续推荐其他书籍...]
-
-请直接输出推荐内容，不要包含其他客套话。`;
-
-      recommendMessages = [
-        { role: 'system' as const, content: recommendSystemPrompt },
-        { role: 'user' as const, content: `用户阅读偏好：${preference}\n\n${booksContext}` }
-      ];
-    } else {
-      // 没有书库数据：联网AI搜索推荐
+      // AI 推荐的系统提示
       const recommendSystemPrompt = `你是一位专业的网文推荐助手。你的任务是根据用户的阅读偏好，推荐合适的网文小说。
 
 请遵循以下规则：
@@ -172,6 +126,7 @@ export async function POST(request: NextRequest) {
 3. 使用清晰的格式展示，便于用户快速浏览
 4. 推荐理由要具体，说明为什么符合用户的偏好
 5. 输出格式使用Markdown，每本书作为一个独立的章节
+6. 不要编造不存在的书籍，推荐真实的、知名的作品
 
 输出模板：
 ## 推荐理由
@@ -181,7 +136,7 @@ export async function POST(request: NextRequest) {
 
 ### 1. [书名]
 - **作者**: [作者名]
-- **类型**: [类型，如：古言、现言、权谋、热血成长等]
+- **类型**: [类型，如：古言、现言、权谋、热血成长、无限流、耽美等]
 - **简介**: [一句话简介]
 - **推荐理由**: [为什么推荐这本书，如何符合用户偏好]
 
@@ -191,50 +146,77 @@ export async function POST(request: NextRequest) {
 
 请直接输出推荐内容，不要包含其他客套话。`;
 
-      recommendMessages = [
+      const recommendMessages = [
         { role: 'system' as const, content: recommendSystemPrompt },
-        { role: 'user' as const, content: preference }
+        { role: 'user' as const, content: `用户阅读偏好：${preference}` }
       ];
-    }
 
-    // 使用流式输出AI生成的推荐
-    const stream = llmClient.stream(recommendMessages, {
-      model: 'doubao-seed-1-8-251228',
-      temperature: 0.8,
-      thinking: 'disabled',
-      caching: 'disabled'
-    });
+      console.log('Sending request to LLM...');
 
-    // 创建可读流，流式输出AI生成的推荐
-    const encoder = new TextEncoder();
-    const readableStream = new ReadableStream({
-      async start(controller) {
-        try {
-          for await (const chunk of stream) {
-            if (chunk.content) {
-              const text = chunk.content.toString();
-              controller.enqueue(encoder.encode(text));
+      // 使用流式输出
+      const stream = llmClient.stream(recommendMessages, {
+        model: 'doubao-seed-1-8-251228',
+        temperature: 0.8,
+        thinking: 'disabled',
+        caching: 'disabled'
+      });
+
+      console.log('Stream created successfully');
+
+      // 创建可读流，流式输出AI生成的推荐
+      const encoder = new TextEncoder();
+      const readableStream = new ReadableStream({
+        async start(controller) {
+          try {
+            let chunkCount = 0;
+            for await (const chunk of stream) {
+              if (chunk.content) {
+                const text = chunk.content.toString();
+                chunkCount++;
+                console.log(`Chunk ${chunkCount}:`, text.substring(0, 50) + '...');
+                controller.enqueue(encoder.encode(text));
+              }
             }
+            console.log(`Total chunks: ${chunkCount}`);
+            controller.close();
+          } catch (error) {
+            console.error('Streaming error:', error);
+            controller.error(error);
           }
-          controller.close();
-        } catch (error) {
-          console.error('Streaming error:', error);
-          controller.error(error);
         }
-      }
-    });
+      });
 
-    return new Response(readableStream, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Transfer-Encoding': 'chunked'
-      }
-    });
+      console.log('Returning stream response');
+
+      return new Response(readableStream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Transfer-Encoding': 'chunked'
+        }
+      });
+
+    } catch (aiError) {
+      console.error('AI API failed:', aiError);
+      console.error('AI Error details:', JSON.stringify(aiError, null, 2));
+
+      // 降级：使用模拟数据
+      console.log('Falling back to mock data');
+      const mockResponse = getMockRecommendation(preference);
+
+      return new Response(mockResponse, {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-cache',
+        }
+      });
+    }
 
   } catch (error) {
     console.error('Recommend Books API error:', error);
+    console.error('Error details:', JSON.stringify(error, null, 2));
+
     return new Response(
       JSON.stringify({ error: '生成推荐失败，请重试' }),
       {
